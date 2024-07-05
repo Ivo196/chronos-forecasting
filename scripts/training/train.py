@@ -5,11 +5,14 @@ import ast
 import logging
 import os
 import re
+import sys
+import json
 import itertools
 import random
+from copy import deepcopy
 from pathlib import Path
 from functools import partial
-from typing import List, Iterator, Optional
+from typing import List, Iterator, Optional, Dict
 
 import typer
 from typer_config import use_yaml_config
@@ -26,6 +29,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+import accelerate
+import gluonts
 from gluonts.dataset.common import FileDataset
 from gluonts.itertools import Cyclic, Map, Filter
 from gluonts.transform import (
@@ -34,6 +39,9 @@ from gluonts.transform import (
     ValidationSplitSampler,
     InstanceSplitter,
     ExpectedNumInstanceSampler,
+    MissingValueImputation,
+    LeavesMissingValues,
+    LastValueImputation,
 )
 
 from chronos import ChronosConfig, ChronosTokenizer
@@ -57,6 +65,56 @@ def log_on_main(msg: str, logger: logging.Logger, log_level: int = logging.INFO)
     """
     if is_main_process():
         logger.log(log_level, msg)
+
+
+def get_training_job_info() -> Dict:
+    """
+    Returns info about this training job.
+    """
+    job_info = {}
+
+    # CUDA info
+    job_info["cuda_available"] = torch.cuda.is_available()
+    if torch.cuda.is_available():
+        job_info["device_count"] = torch.cuda.device_count()
+
+        job_info["device_names"] = {
+            idx: torch.cuda.get_device_name(idx)
+            for idx in range(torch.cuda.device_count())
+        }
+        job_info["mem_info"] = {
+            idx: torch.cuda.mem_get_info(device=idx)
+            for idx in range(torch.cuda.device_count())
+        }
+
+    # DDP info
+    job_info["torchelastic_launched"] = dist.is_torchelastic_launched()
+
+    if dist.is_torchelastic_launched():
+        job_info["world_size"] = dist.get_world_size()
+
+    # Versions
+    job_info["python_version"] = sys.version.replace("\n", " ")
+    job_info["torch_version"] = torch.__version__
+    job_info["numpy_version"] = np.__version__
+    job_info["gluonts_version"] = gluonts.__version__
+    job_info["transformers_version"] = transformers.__version__
+    job_info["accelerate_version"] = accelerate.__version__
+
+    return job_info
+
+
+def save_training_info(ckpt_path: Path, training_config: Dict):
+    """
+    Save info about this training job in a json file for documentation.
+    """
+    assert ckpt_path.is_dir()
+    with open(ckpt_path / "training_info.json", "w") as fp:
+        json.dump(
+            {"training_config": training_config, "job_info": get_training_job_info()},
+            fp,
+            indent=4,
+        )
 
 
 def get_next_path(
@@ -246,6 +304,8 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         prediction_length: int = 64,
         drop_prob: float = 0.2,
         min_past: Optional[int] = None,
+        model_type: str = "seq2seq",
+        imputation_method: Optional[MissingValueImputation] = None,
         mode: str = "training",
         np_dtype=np.float32,
     ) -> None:
@@ -253,14 +313,17 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
 
         assert len(probabilities) == len(datasets)
         assert mode in ("training", "validation", "test")
+        assert model_type in ("seq2seq", "causal")
 
         self.datasets = datasets
         self.probabilities = probabilities
         self.tokenizer = tokenizer
         self.context_length = context_length
         self.prediction_length = prediction_length
-        self.drop_prob = drop_prob
+        self.drop_prob = drop_prob if model_type == "seq2seq" else 0.0
         self.min_past = min_past or prediction_length
+        self.model_type = model_type
+        self.imputation_method = imputation_method or LeavesMissingValues()
         self.mode = mode
         self.np_dtype = np_dtype
 
@@ -268,6 +331,11 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
         entry = {f: entry[f] for f in ["start", "target"]}
         entry["target"] = np.asarray(entry["target"], dtype=self.np_dtype)
         assert entry["target"].ndim == 1, f"got {entry['target'].ndim=}, expected 1"
+
+        if self.model_type == "causal":
+            # Causal models do not play nice with missing values, so it is
+            # recommended to use an imputation method, e.g., LastValueImputation
+            entry["target"] = self.imputation_method(entry["target"])
 
         if mode == "training" and self.drop_prob > 0:
             target = entry["target"].copy()
@@ -325,10 +393,54 @@ class ChronosDataset(IterableDataset, ShuffleMixin):
 
     def to_hf_format(self, entry: dict) -> dict:
         past_target = torch.tensor(entry["past_target"]).unsqueeze(0)
-        input_ids, attention_mask, scale = self.tokenizer.input_transform(past_target)
+        input_ids, attention_mask, scale = self.tokenizer.context_input_transform(
+            past_target
+        )
         future_target = torch.tensor(entry["future_target"]).unsqueeze(0)
-        labels, labels_mask, _ = self.tokenizer.input_transform(future_target, scale)
+        labels, labels_mask = self.tokenizer.label_input_transform(future_target, scale)
         labels[labels_mask == 0] = -100
+
+        if self.model_type == "causal":
+            # The InstanceSplitter pads time series on the left to be equal to the
+            # context_length. However, certain models (e.g., GPT2) with absolute
+            # position embeddings should not be trained with left padding.
+            # The following piece of code moves padding from left to right.
+
+            assert input_ids.shape[-1] == entry["past_is_pad"].shape[0]
+
+            # Find the index where padding starts
+            pad_start_idx = np.searchsorted(1 - entry["past_is_pad"], 1)
+            padded_input_ids, obs_input_ids = torch.tensor_split(
+                input_ids, [pad_start_idx], dim=-1
+            )
+            padded_attention_mask, obs_attention_mask = torch.tensor_split(
+                attention_mask, [pad_start_idx], dim=-1
+            )
+
+            # Move padding to the right
+            input_ids = torch.cat(
+                [
+                    obs_input_ids,
+                    labels,
+                    padded_input_ids,
+                ],
+                axis=-1,
+            )
+            attention_mask = torch.cat(
+                [
+                    obs_attention_mask,
+                    labels_mask,
+                    padded_attention_mask,
+                ],
+                axis=-1,
+            )
+
+            # labels for causal models are same as the input_ids.
+            # Internally transformers shifts the labels by one during training.
+            labels = input_ids.clone()
+            input_ids[~attention_mask] = self.tokenizer.config.pad_token_id
+            labels[~attention_mask] = -100
+
         return {
             "input_ids": input_ids.squeeze(0),
             "attention_mask": attention_mask.squeeze(0),
@@ -407,7 +519,7 @@ def main(
     model_type: str = "seq2seq",
     random_init: bool = False,
     tie_embeddings: bool = False,
-    output_dir: Path = Path("./output/"),
+    output_dir: str = "./output/",
     tf32: bool = True,
     torch_compile: bool = True,
     tokenizer_class: str = "MeanScaleUniformBins",
@@ -427,6 +539,27 @@ def main(
     top_p: float = 1.0,
     seed: Optional[int] = None,
 ):
+    if tf32 and not (
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+    ):
+        # TF32 floating point format is available only on NVIDIA GPUs
+        # with compute capability 8 and above. See link for details.
+        # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#compute-capability-8-x
+        log_on_main(
+            "TF32 format is only available on devices with compute capability >= 8. "
+            "Setting tf32 to False.",
+            logger,
+        )
+        tf32 = False
+
+    if seed is None:
+        seed = random.randint(0, 2**32)
+
+    log_on_main(f"Using SEED: {seed}", logger)
+    transformers.set_seed(seed=seed)
+
+    raw_training_config = deepcopy(locals())
+    output_dir = Path(output_dir)
     training_data_paths = ast.literal_eval(training_data_paths)
     assert isinstance(training_data_paths, list)
 
@@ -441,15 +574,6 @@ def main(
     assert isinstance(tokenizer_kwargs, dict)
 
     assert model_type in ["seq2seq", "causal"]
-
-    if not model_type == "seq2seq":
-        raise NotImplementedError("Only seq2seq models are currently supported")
-
-    if seed is None:
-        seed = random.randint(0, 2**32)
-
-    log_on_main(f"Using SEED: {seed}", logger)
-    transformers.set_seed(seed=seed)
 
     output_dir = get_next_path("run", base_dir=output_dir, file_type="")
 
@@ -516,6 +640,8 @@ def main(
         context_length=context_length,
         prediction_length=prediction_length,
         min_past=min_past,
+        model_type=model_type,
+        imputation_method=LastValueImputation() if model_type == "causal" else None,
         mode="training",
     ).shuffle(shuffle_buffer_length=shuffle_buffer_length)
 
@@ -554,6 +680,9 @@ def main(
 
     if is_main_process():
         model.save_pretrained(output_dir / "checkpoint-final")
+        save_training_info(
+            output_dir / "checkpoint-final", training_config=raw_training_config
+        )
 
 
 if __name__ == "__main__":

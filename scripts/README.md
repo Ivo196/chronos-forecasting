@@ -89,10 +89,58 @@
     The output and checkpoints will be saved in `output/run-{id}/`.
 > [!TIP]  
 > If the initial training step is too slow, you might want to change the `shuffle_buffer_length` and/or set `torch_compile` to `false`.
+
+> [!IMPORTANT]  
+> When pretraining causal models (such as GPT2), the training script does [`LastValueImputation`](https://github.com/awslabs/gluonts/blob/f0f2266d520cb980f4c1ce18c28b003ad5cd2599/src/gluonts/transform/feature.py#L103) for missing values by default. If you pretrain causal models, please ensure that missing values are imputed similarly before passing the context tensor to `ChronosPipeline.predict()` for accurate results.
 - (Optional) Once trained, you can easily push your fine-tuned model to HuggingFace🤗 Hub. Before that, do not forget to [create an access token](https://huggingface.co/settings/tokens) with **write permissions** and put it in `~/.cache/huggingface/token`. Here's a snippet that will push a fine-tuned model to HuggingFace🤗 Hub at `<your_hf_username>/chronos-t5-small-fine-tuned`.
     ```py
     from chronos import ChronosPipeline
 
     pipeline = ChronosPipeline.from_pretrained("/path/to/fine-tuned/model/ckpt/dir/")
     pipeline.model.model.push_to_hub("chronos-t5-small-fine-tuned")
+    ```
+
+## Evaluating Chronos models
+
+Follow these steps to compute the WQL and MASE values for the in-domain and zero-shot benchmarks in our paper.
+
+- Install this package with with the `evaluation` extra:
+    ```
+    pip install "chronos[evaluation] @ git+https://github.com/amazon-science/chronos-forecasting.git"
+    ```
+- Run the evaluation script:
+    ```sh
+    # In-domain evaluation
+    # Results will be saved in: evaluation/results/chronos-t5-small-in-domain.csv
+    python evaluation/evaluate.py evaluation/configs/in-domain.yaml evaluation/results/chronos-t5-small-in-domain.csv \
+        --chronos-model-id "amazon/chronos-t5-small" \
+        --batch-size=32 \
+        --device=cuda:0 \
+        --num-samples 20
+
+    # Zero-shot evaluation
+    # Results will be saved in: evaluation/results/chronos-t5-small-zero-shot.csv
+    python evaluation/evaluate.py evaluation/configs/zero-shot.yaml evaluation/results/chronos-t5-small-zero-shot.csv \
+        --chronos-model-id "amazon/chronos-t5-small" \
+        --batch-size=32 \
+        --device=cuda:0 \
+        --num-samples 20
+    ```
+- Use the following snippet to compute the aggregated relative WQL and MASE scores:
+    ```py
+    import pandas as pd
+    from scipy.stats import gmean  # requires: pip install scipy
+
+
+    def agg_relative_score(model_df: pd.DataFrame, baseline_df: pd.DataFrame):
+        relative_score = model_df.drop("model", axis="columns") / baseline_df.drop(
+            "model", axis="columns"
+        )
+        return relative_score.agg(gmean)
+
+
+    result_df = pd.read_csv("evaluation/results/chronos-t5-small-in-domain.csv").set_index("dataset")
+    baseline_df = pd.read_csv("evaluation/results/seasonal-naive-in-domain.csv").set_index("dataset")
+
+    agg_score_df = agg_relative_score(result_df, baseline_df)
     ```
